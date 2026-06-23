@@ -503,11 +503,21 @@ class GraphStore:
 
         # bare_name -> list of qualified_names
         node_lookup: dict[str, list[str]] = {}
+        # (parent_upper, name_upper) -> list of qualified_names. Used to resolve
+        # PL/SQL package-qualified call targets of the form ``PKG.PROC`` against
+        # package members (which carry parent_name=PKG). Package names are
+        # globally unique in Oracle, so this is a high-confidence, unambiguous
+        # match — and it recovers the bulk of cross-package CALLS edges.
+        member_lookup: dict[tuple[str, str], list[str]] = {}
         for row in conn.execute(
-            "SELECT name, qualified_name FROM nodes "
+            "SELECT name, parent_name, qualified_name FROM nodes "
             "WHERE kind IN ('Function', 'Test', 'Class')"
         ).fetchall():
             node_lookup.setdefault(row["name"], []).append(row["qualified_name"])
+            if row["parent_name"]:
+                member_lookup.setdefault(
+                    (row["parent_name"].upper(), row["name"].upper()), []
+                ).append(row["qualified_name"])
 
         # source_file -> set of imported files (for disambiguation)
         import_targets: dict[str, set[str]] = {}
@@ -522,6 +532,22 @@ class GraphStore:
         resolved = 0
         for edge in bare_edges:
             bare_name = edge["target_qualified"]
+
+            # PL/SQL package-qualified target (PKG.PROC or SCHEMA.PKG.PROC):
+            # resolve against package members by (parent, name) first.
+            if "." in bare_name:
+                parts = bare_name.split(".")
+                member_cands = member_lookup.get(
+                    (parts[-2].upper(), parts[-1].upper()), []
+                )
+                if len(member_cands) == 1:
+                    conn.execute(
+                        "UPDATE edges SET target_qualified = ? WHERE id = ?",
+                        (member_cands[0], edge["id"]),
+                    )
+                    resolved += 1
+                    continue
+
             candidates = node_lookup.get(bare_name, [])
             if not candidates:
                 continue

@@ -136,6 +136,11 @@ DEFAULT_IGNORE_PATTERNS = [
     "*.sqlite",
     "*.db-journal",
     "*.db-wal",
+    # Oracle exports: "*_WRP" folders hold wrapped (obfuscated) duplicates of
+    # objects that also exist unwrapped in their sibling folder (e.g.
+    # "PACKAGE BODY_WRP" mirrors "PACKAGE BODY"). They carry no parseable
+    # source — omit them entirely so they never produce nodes/edges. See INSIS.
+    "*_WRP/**",
 ]
 
 
@@ -386,7 +391,10 @@ def _should_ignore(path: str, patterns: list[str]) -> bool:
         # qualify for nested matching.
         if "/" in prefix or not prefix:
             continue
-        if prefix in parts:
+        # Match the bare prefix against each path segment. fnmatch lets a
+        # wildcard prefix such as "*_WRP" match any segment ending in "_WRP"
+        # (e.g. "PACKAGE BODY_WRP"); a literal prefix still matches exactly.
+        if any(fnmatch.fnmatch(part, prefix) for part in parts):
             return True
     return False
 
@@ -905,11 +913,19 @@ def full_build(
     spring_stats = _run_spring_resolver(store)
     temporal_stats = _run_temporal_resolver(store)
 
+    # Resolve bare-name CALLS targets (cross-file/cross-package) against the
+    # now-complete node table. Critical for PL/SQL, where calls are emitted as
+    # ``PKG.PROC`` and only become navigable once linked to member nodes.
+    # Runs LAST so the language-specific resolvers above (higher-confidence)
+    # claim their edges first and their reported stats stay accurate.
+    bare_resolved = store.resolve_bare_call_targets()
+
     return {
         "files_parsed": len(files),
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "errors": errors,
+        "bare_calls_resolved": bare_resolved,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
         "temporal_resolution": temporal_stats,
